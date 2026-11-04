@@ -21,6 +21,7 @@ from datasets.table import (
     _in_memory_arrow_table_from_file,
     _interpolation_search,
     _memory_mapped_arrow_table_from_file,
+    _null_safe_not_equal,
     array_cast,
     cast_array_to_feature,
     cast_table_to_schema,
@@ -33,6 +34,45 @@ from datasets.table import (
 )
 
 from .utils import assert_arrow_memory_doesnt_increase, assert_arrow_memory_increases, slow
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_null_safe_not_equal(chunked):
+    left = pa.array([None, None, 1, 1, 2], type=pa.int64())
+    right = pa.array([None, 1, None, 1, 1], type=pa.int64())
+    if chunked:
+        left = pa.chunked_array([left[:2], left[2:]])
+        right = pa.chunked_array([right[:3], right[3:]])
+    assert _null_safe_not_equal(left, right).to_pylist() == [False, True, True, False, True]
+    assert _null_safe_not_equal(left, pa.scalar(None, type=pa.int64())).to_pylist() == [False, False, True, True, True]
+    assert _null_safe_not_equal(left, pa.scalar(1)).to_pylist() == [True, True, False, False, True]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("length", [0, 3])
+def test_null_safe_not_equal_null_type(chunked, length):
+    array = pa.nulls(length)
+    if chunked:
+        array = pa.chunked_array([array])
+    assert _null_safe_not_equal(array, array).to_pylist() == [False] * length
+    assert _null_safe_not_equal(array, pa.scalar(None)).to_pylist() == [False] * length
+
+
+def test_null_safe_not_equal_preserves_nan():
+    left = pa.array([float("nan"), None, float("nan"), 1.0])
+    right = pa.array([float("nan"), float("nan"), None, 1.0])
+    assert _null_safe_not_equal(left, right).to_pylist() == [True, True, True, False]
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_null_safe_not_equal_without_nulls_skips_null_computation(monkeypatch, scalar):
+    def unexpected_null_computation(*args, **kwargs):
+        pytest.fail("Null-free keys should use Arrow's existing inequality kernel directly")
+
+    monkeypatch.setattr("datasets.table.pc.is_null", unexpected_null_computation)
+    left = pa.array([1, 2])
+    right = pa.scalar(1) if scalar else pa.array([1, 1])
+    assert _null_safe_not_equal(left, right).to_pylist() == [False, True]
 
 
 @pytest.fixture(scope="session")

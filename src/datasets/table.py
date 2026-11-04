@@ -68,6 +68,19 @@ def _batch_arrow_table(table: pa.Table) -> pa.Table:
     return pa.Table.from_arrays(batched_columns, names=table.column_names)
 
 
+def _null_safe_not_equal(
+    left: Union[pa.Array, pa.ChunkedArray], right: Union[pa.Array, pa.ChunkedArray, pa.Scalar]
+) -> Union[pa.Array, pa.ChunkedArray]:
+    """Compare grouping keys, treating two nulls as equal and a null/value pair as different."""
+    if pa.types.is_null(left.type) or pa.types.is_null(right.type):
+        # Arrow has no inequality kernel for the null type.
+        return pc.xor(pc.is_null(left), pc.is_null(right))
+    right_has_nulls = not right.is_valid if isinstance(right, pa.Scalar) else right.null_count > 0
+    if left.null_count == 0 and not right_has_nulls:
+        return pc.not_equal(left, right)
+    return pc.or_(pc.fill_null(pc.not_equal(left, right), False), pc.xor(pc.is_null(left), pc.is_null(right)))
+
+
 def _batch_accumulate_arrow_table_by_columns(
     table: pa.Table, indices: list[int], columns: tuple[str], tables_accumulator: list[pa.Table], length: Optional[int]
 ) -> pa.Table:
@@ -75,7 +88,7 @@ def _batch_accumulate_arrow_table_by_columns(
     # keep accumulating if key is the same, otherwise include the accumulated tables
     if tables_accumulator and accumulate_last_batch:
         for column in columns:
-            if any(pc.not_equal(table[column], tables_accumulator[0][column][0]).to_pylist()):
+            if any(_null_safe_not_equal(table[column], tables_accumulator[0][column][0]).to_pylist()):
                 break
         else:
             tables_accumulator.append(table)
@@ -93,9 +106,9 @@ def _batch_accumulate_arrow_table_by_columns(
         return table
     # cut the table per key, i.e. when the columns change value
     if len(table) > 1:
-        cut_array = pc.not_equal(table[columns[0]][1:], table[columns[0]][:-1])
+        cut_array = _null_safe_not_equal(table[columns[0]][1:], table[columns[0]][:-1])
         for column in columns[1:]:
-            cut_array = pc.or_(cut_array, pc.not_equal(table[column][1:], table[column][:-1]))
+            cut_array = pc.or_(cut_array, _null_safe_not_equal(table[column][1:], table[column][:-1]))
     else:
         cut_array = pa.array([], type=pa.uint64())
     offsets = pc.indices_nonzero(cut_array)

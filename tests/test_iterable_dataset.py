@@ -3947,6 +3947,34 @@ def test_iterable_dataset_batch_by_column(num_shards: int):
         )
 
 
+@pytest.mark.parametrize("num_shards", [1, 3])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 1000])
+@pytest.mark.parametrize(
+    "keys, expected_ids",
+    [
+        (["A", None, "B"], [[0], [1], [2]]),
+        ([None, None, "A", "A", None, "B", None], [[0, 1], [2, 3], [4], [5], [6]]),
+        ([None, None, None], [[0, 1, 2]]),
+        ([float("nan"), float("nan"), 1.0, 1.0, float("nan")], [[0], [1], [2, 3], [4]]),
+    ],
+)
+def test_iterable_dataset_batch_by_column_null_boundaries(num_shards, batch_size, keys, expected_ids):
+    ds = IterableDataset.from_dict({"key": keys, "id": list(range(len(keys)))}, num_shards=num_shards)
+    assert [batch["id"] for batch in ds.batch(by_column="key", batch_size=batch_size)] == expected_ids
+
+
+@pytest.mark.parametrize("num_shards", [1, 3])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 1000])
+@pytest.mark.parametrize("columns", [["key", "other"], ["other", "key"]])
+def test_iterable_dataset_batch_by_columns_with_null_key(num_shards, batch_size, columns):
+    ds = IterableDataset.from_dict(
+        {"key": [None] * 4, "other": ["A", "B", "B", "A"], "id": list(range(4))},
+        features=Features({"key": Value("string"), "other": Value("string"), "id": Value("int64")}),
+        num_shards=num_shards,
+    )
+    assert [batch["id"] for batch in ds.batch(by_column=columns, batch_size=batch_size)] == [[0], [1, 2], [3]]
+
+
 @pytest.mark.parametrize("format_type", ["pyarrow", "pandas"])
 def test_iterable_dataset_batch_with_table_format(format_type):
     ds = IterableDataset.from_dict({"a": [1, 2, 3, 4]})
