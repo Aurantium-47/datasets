@@ -119,6 +119,32 @@ To load remote JSON files via HTTP, pass the URLs instead:
 
 While these are the most common JSON formats, you'll see other datasets that are formatted differently. 🤗 Datasets recognizes these other formats and will fallback accordingly on the Python JSON loading methods to handle them.
 
+#### Read a large JSON array in batches
+
+For a large UTF-8 top-level array, such as `[{"input_ids": [101, 102], "attention_mask": [1, 1]}, ...]`, opt in to `json_array_batching=True` and provide an explicit schema:
+
+```py
+>>> from datasets import Features, List, Value, load_dataset
+>>> features = Features({
+...     "input_ids": List(Value("int32")),
+...     "attention_mask": List(Value("int8")),
+... })
+>>> dataset = load_dataset(
+...     "json",
+...     data_files="tokens.json",
+...     features=features,
+...     json_array_batching=True,
+...     chunksize=1 << 20,
+...     split="train",
+... )
+```
+
+This avoids materializing the entire array in Python before converting it to Arrow. It works with regular loading and with `streaming=True`, including `.json.gz` files. `chunksize` is a target number of input bytes, and batches always end between records. Memory use depends on the chunk size and the largest record, not only the number of records. A single oversized record still needs to fit in memory. An incomplete or malformed record may be buffered until the end of the file before an error can be reported.
+
+The option is disabled by default. It currently requires UTF-8 input and does not support selecting a nested array with `field=`. JSON Lines input continues to use the JSON Lines reader.
+
+Like JSON Lines, conversion is performed per batch. Supplying `features` specifies the output schema, but does not eliminate intermediate type inference. Mixed numeric types can therefore be converted differently from the default whole-array reader. For example, casting `[{"x": 9007199254740993}, {"x": 1.0}]` to an `int64` column loses precision in the first value when both records are inferred together as floating point; separate batches can preserve that integer. Use consistent value types for each field when results must be independent of batch boundaries. Malformed arrays raise an error rather than falling back to a whole-file reader.
+
 ### Parquet
 
 Parquet files are stored in a columnar format, unlike row-based files like a CSV. Large datasets may be stored in a Parquet file because it is more efficient and faster at returning your query. 

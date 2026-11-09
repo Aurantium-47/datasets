@@ -1,6 +1,8 @@
 import codecs
 import io
+import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,112 @@ class FullReadDisallowed(Exception):
     pass
 
 
+def _iter_json_array_batches(stream, first_chunk, chunksize, encoding_errors="strict"):
+    """Yield complete UTF-8 array fragments bounded by chunksize + largest record.
+
+    The standard decoder locates/validates records, but does not determine their
+    numeric values. Callers retain the existing ujson parser for conversion.
+    """
+    text_decoder = codecs.getincrementaldecoder("utf-8")(errors=encoding_errors)
+    # Avoid expensive/int-limit-dependent conversion merely to locate boundaries.
+    record_decoder = json.JSONDecoder(
+        parse_int=lambda value: None,
+        parse_float=lambda value: None,
+        parse_constant=lambda value: None,
+        object_pairs_hook=lambda value: None,
+    )
+    buffer = text_decoder.decode(first_chunk)[1:]
+    position = 0
+    eof = False
+    allow_empty = True
+    records = []
+    size = 0
+
+    def read_more():
+        nonlocal buffer, position, eof
+        chunk = stream.read(chunksize)
+        eof = not chunk
+        buffer = buffer[position:] + text_decoder.decode(chunk, final=eof)
+        position = 0
+
+    while True:
+        while position < len(buffer) and buffer[position] in " \t\r\n":
+            position += 1
+        if position == len(buffer):
+            if eof:
+                raise ValueError("Unexpected end of JSON array")
+            read_more()
+            continue
+        if buffer[position] == "]":
+            if not allow_empty:
+                raise ValueError("Trailing comma in JSON array")
+            position += 1
+            break
+        try:
+            end = record_decoder.raw_decode(buffer, position)[1]
+        except json.JSONDecodeError:
+            if eof:
+                raise
+            read_more()
+            continue
+        separator = end
+        if separator < len(buffer) and buffer[separator] in " \t\r\n":
+            # Whitespace terminates a scalar. Keep the record but discard gaps
+            # between records instead of retaining/reparsing arbitrarily long
+            # whitespace while waiting for the comma or closing bracket.
+            record = buffer[position:end]
+            position = separator
+            while True:
+                while position < len(buffer) and buffer[position] in " \t\r\n":
+                    position += 1
+                if position < len(buffer):
+                    break
+                if eof:
+                    raise ValueError("Unexpected end of JSON array")
+                read_more()
+            separator = position
+            if buffer[separator] not in ",]":
+                raise ValueError("Expected a comma or closing bracket in JSON array")
+        elif separator == len(buffer):
+            if eof:
+                raise ValueError("Expected a comma or closing bracket in JSON array")
+            # A number can appear complete before its decimal point or exponent
+            # arrives. Do not commit it until a delimiter or whitespace follows.
+            read_more()
+            continue
+        elif buffer[separator] not in ",]":
+            # raw_decode can return the integer part of a partial float, such as
+            # "1e+". Other suffixes are already invalid and need no further read.
+            if not eof and re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]*)?", buffer[position:]):
+                read_more()
+                continue
+            raise ValueError("Expected a comma or closing bracket in JSON array")
+        else:
+            record = buffer[position:end]
+        records.append(record)
+        size += len(record.encode("utf-8")) + 1
+        close = buffer[separator] == "]"
+        position = separator + 1
+        if close:
+            break
+        allow_empty = False
+        if size >= chunksize:
+            yield ("[" + ",".join(records) + "]").encode("utf-8")
+            records = []
+            size = 0
+
+    # Reject non-whitespace after the document, without retaining trailing data.
+    if buffer[position:].strip(" \t\r\n"):
+        raise ValueError("Extra data after JSON array")
+    while not eof:
+        position = len(buffer)
+        read_more()
+        if buffer[position:].strip(" \t\r\n"):
+            raise ValueError("Extra data after JSON array")
+    if records:
+        yield ("[" + ",".join(records) + "]").encode("utf-8")
+
+
 @dataclass
 class JsonConfig(datasets.BuilderConfig):
     """BuilderConfig for JSON."""
@@ -56,6 +164,7 @@ class JsonConfig(datasets.BuilderConfig):
     newlines_in_values: Optional[bool] = None
     on_mixed_types: Optional[Literal["use_json"]] = "use_json"
     parse_agent_traces: bool = True
+    json_array_batching: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -65,9 +174,18 @@ class Json(datasets.ArrowBasedBuilder):
     BUILDER_CONFIG_CLASS = JsonConfig
 
     def _info(self):
+        if self.config.json_array_batching:
+            if self.config.features is None:
+                raise ValueError("json_array_batching=True requires explicit features")
+            if self.config.encoding != "utf-8":
+                raise ValueError("json_array_batching=True currently supports only encoding='utf-8'")
+            if self.config.field is not None:
+                raise ValueError("json_array_batching=True does not support field=; use a top-level JSON array")
         if self.config.block_size is not None:
             logger.warning("The JSON loader parameter `block_size` is deprecated. Please use `chunksize` instead")
             self.config.chunksize = self.config.block_size
+        if self.config.json_array_batching and self.config.chunksize <= 0:
+            raise ValueError("json_array_batching=True requires a positive chunksize")
         if self.config.use_threads is not True:
             logger.warning(
                 "The JSON loader parameter `use_threads` is deprecated and doesn't have any effect anymore."
@@ -230,8 +348,29 @@ class Json(datasets.ArrowBasedBuilder):
                         encoding_errors = (
                             self.config.encoding_errors if self.config.encoding_errors is not None else "strict"
                         )
+                        array_batches = None
                         while True:
-                            batch = f.read(self.config.chunksize)
+                            batch = (
+                                next(array_batches, b"")
+                                if array_batches is not None
+                                else f.read(self.config.chunksize)
+                            )
+                            if self.config.json_array_batching and batch_idx == 0 and array_batches is None:
+                                # An array may start after a BOM or whitespace. Keep
+                                # probing bounded even for a long whitespace prefix.
+                                while batch and len(batch) < 3 and codecs.BOM_UTF8.startswith(batch):
+                                    more = f.read(3 - len(batch))
+                                    if not more:
+                                        break
+                                    batch += more
+                                if batch.startswith(codecs.BOM_UTF8):
+                                    batch = batch[len(codecs.BOM_UTF8) :]
+                                batch = batch.lstrip(b" \t\r\n")
+                                while not batch:
+                                    batch = f.read(self.config.chunksize)
+                                    if not batch:
+                                        break
+                                    batch = batch.lstrip(b" \t\r\n")
                             if not batch:
                                 break
                             # A leading UTF-8 BOM makes the ujson pre-scan below raise
@@ -242,7 +381,25 @@ class Json(datasets.ArrowBasedBuilder):
                             if shard_idx == 0 and batch_idx == 0 and batch.startswith(codecs.BOM_UTF8):
                                 batch = batch[len(codecs.BOM_UTF8) :]
                             if batch.startswith(b"["):
-                                if not allow_full_read:
+                                if self.config.json_array_batching:
+
+                                    def to_jsonlines(arrays):
+                                        wrap_text = None
+                                        for array in arrays:
+                                            examples = ujson_loads(array)
+                                            if wrap_text is None:
+                                                wrap_text = not isinstance(examples[0], dict)
+                                            yield "\n".join(
+                                                ujson_dumps({"text": x} if wrap_text else x) for x in examples
+                                            ).encode()
+
+                                    array_batches = to_jsonlines(
+                                        _iter_json_array_batches(f, batch, self.config.chunksize, encoding_errors)
+                                    )
+                                    batch = next(array_batches, b"")
+                                    if not batch:
+                                        break
+                                elif not allow_full_read:
                                     raise FullReadDisallowed()
                                 else:
                                     # convert to JSON Lines
@@ -253,11 +410,13 @@ class Json(datasets.ArrowBasedBuilder):
                                         batch = "\n".join(
                                             ujson_dumps({"text": x}) for x in ujson_loads(full_data)
                                         ).encode()
-                            # Finish current line
-                            try:
-                                batch += f.readline()
-                            except (AttributeError, io.UnsupportedOperation):
-                                batch += readline(f)
+                            # Finish the current JSONL line, unless the array reader
+                            # already supplied a batch of complete records.
+                            if array_batches is None:
+                                try:
+                                    batch += f.readline()
+                                except (AttributeError, io.UnsupportedOperation):
+                                    batch += readline(f)
                             # PyArrow only accepts utf-8 encoded bytes
                             if self.config.encoding != "utf-8":
                                 batch = batch.decode(self.config.encoding, errors=encoding_errors).encode("utf-8")
@@ -333,6 +492,10 @@ class Json(datasets.ArrowBasedBuilder):
                                     )
                                     batch_idx += 1
                                     continue
+                                if array_batches is not None:
+                                    # An invalid chunk must not fall back to the
+                                    # whole-file pandas reader in bounded mode.
+                                    raise e
                                 if not allow_full_read:
                                     raise FullReadDisallowed()
                                 try:
